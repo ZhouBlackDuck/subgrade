@@ -3,6 +3,8 @@ import importlib.util
 import os
 from pathlib import Path
 import sys
+import types
+from typing import Annotated, Any, Dict, List, Union, get_args, get_origin
 
 from pydantic import BaseModel
 from pydantic_settings import (
@@ -11,8 +13,92 @@ from pydantic_settings import (
     SettingsConfigDict,
     YamlConfigSettingsSource,
 )
+import yaml
 
 _CFG_MOD_PREFIX = "subgrade._cfgmod"
+
+
+def _unwrap_annotated(annotation: Any) -> Any:
+    """剥去 ``Annotated[T, ...]``，得到 ``T``。"""
+    ann = annotation
+    while get_origin(ann) is Annotated:
+        args = get_args(ann)
+        if not args:
+            break
+        ann = args[0]
+    return ann
+
+
+def _effective_annotation(annotation: Any) -> Any:
+    return _strip_optional(_unwrap_annotated(annotation))
+
+
+def _strip_optional(annotation: Any) -> Any:
+    """将 ``Optional[T]`` / ``T | None`` 归一为 ``T``（单层）。"""
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin is Union:
+        filtered = [a for a in args if a not in (type(None), types.NoneType)]
+        if len(filtered) == 1:
+            return _strip_optional(filtered[0])
+        return annotation
+    if hasattr(types, "UnionType") and origin is types.UnionType:
+        filtered = [a for a in args if a not in (type(None), types.NoneType)]
+        if len(filtered) == 1:
+            return _strip_optional(filtered[0])
+        return annotation
+    return annotation
+
+
+def _is_base_model_type(tp: Any) -> bool:
+    tp = _effective_annotation(tp)
+    if not isinstance(tp, type):
+        return False
+    try:
+        return issubclass(tp, BaseModel)
+    except TypeError:
+        return False
+
+
+def _placeholder_for_annotation(annotation: Any) -> Any:
+    """占位：标量为 ``None``（写入 YAML 为 ``null``）；列表为 ``[]``；``dict`` 为 ``{}``；嵌套模型递归为字典。"""
+    ann = _effective_annotation(annotation)
+    origin = get_origin(ann)
+
+    if _is_base_model_type(ann):
+        return _required_fields_placeholder_dict(ann)
+
+    if origin in (list, List):
+        return []
+
+    if origin in (dict, Dict):
+        return {}
+
+    return None
+
+
+def _required_fields_placeholder_dict(model_cls: type[BaseModel]) -> dict[str, Any]:
+    """仅包含 Pydantic 判定为必填的字段；嵌套 ``BaseModel`` 递归展开。"""
+    out: dict[str, Any] = {}
+    for fname, finfo in model_cls.model_fields.items():
+        if not finfo.is_required():
+            continue
+        out[fname] = _placeholder_for_annotation(finfo.annotation)
+    return out
+
+
+def _write_config_yaml_template(settings_cls: type[BaseSettings], path: Path) -> None:
+    """写入 YAML：必填字段为键；标量占位为 ``null``，列表为 ``[]``，映射为 ``{}``，嵌套为字典。"""
+    data = _required_fields_placeholder_dict(settings_cls)
+    text = yaml.safe_dump(
+        data,
+        allow_unicode=True,
+        default_flow_style=False,
+        sort_keys=False,
+    )
+    if not text.endswith("\n"):
+        text += "\n"
+    path.write_text(text, encoding="utf-8")
 
 
 def _cfg_basedir() -> Path:
@@ -29,7 +115,10 @@ def _settings_basedir() -> Path:
     return Path("settings")
 
 
-def _ensure_module_yaml(settings_root: Path, module_name: str) -> list[Path]:
+def _ensure_module_yaml(
+    settings_root: Path, module_name: str
+) -> tuple[list[Path], bool]:
+    """解析或占位设置文件路径。若需新建 ``.yaml``，返回 ``(paths, True)``，由调用方在类创建后写入模板。"""
     yaml_path = settings_root / f"{module_name}.yaml"
     yml_path = settings_root / f"{module_name}.yml"
     if yaml_path.is_file() or yml_path.is_file():
@@ -38,10 +127,9 @@ def _ensure_module_yaml(settings_root: Path, module_name: str) -> list[Path]:
             paths.append(yaml_path)
         if yml_path.is_file():
             paths.append(yml_path)
-        return paths
+        return paths, False
     settings_root.mkdir(parents=True, exist_ok=True)
-    yaml_path.write_text("{}\n", encoding="utf-8")
-    return [yaml_path]
+    return [yaml_path], True
 
 
 def _load_cfg_module(path: Path, stem: str) -> None:
@@ -98,11 +186,13 @@ class ConfigMeta(type(BaseModel)):
                 f"Module '{module_name}' may only define one Config subclass"
             )
 
-        yaml_path = _ensure_module_yaml(_settings_basedir(), module_name)
+        yaml_paths, pending_template = _ensure_module_yaml(
+            _settings_basedir(), module_name
+        )
         env_prefix = f"{name.replace('Config', '').upper()}_"
         default = SettingsConfigDict(
             env_prefix=env_prefix,
-            yaml_file=yaml_path,
+            yaml_file=yaml_paths,
         )
         if "model_config" not in dct:
             dct["model_config"] = default
@@ -110,7 +200,11 @@ class ConfigMeta(type(BaseModel)):
             dct["model_config"].setdefault("env_prefix", default["env_prefix"])
             dct["model_config"].setdefault("yaml_file", default["yaml_file"])
 
-        Configs.__configs__[module_name] = super().__new__(mcs, name, bases, dct)
+        new_cls = super().__new__(mcs, name, bases, dct)
+        if pending_template:
+            primary = yaml_paths[0]
+            _write_config_yaml_template(new_cls, primary)
+        Configs.__configs__[module_name] = new_cls
         return Configs.__configs__[module_name]
 
 

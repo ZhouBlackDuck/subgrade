@@ -5,8 +5,10 @@ import importlib
 from pathlib import Path
 import sys
 
+from pydantic import ValidationError
 from pydantic_settings import SettingsConfigDict
 import pytest
+import yaml
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -47,12 +49,9 @@ def test_config_resolves_paths_via_env_vars(project_root_with_env: Path) -> None
 
 
 def test_two_config_classes_in_one_module_raise_type_error(
-    monkeypatch: pytest.MonkeyPatch,
+    dup_module_env: Path,
 ) -> None:
-    root = FIXTURES / "dup_module"
-    monkeypatch.chdir(root)
-    monkeypatch.delenv("CFG_BASEDIR", raising=False)
-    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    assert Path.cwd() == dup_module_env
     cfg_mod = _import_subgrade_config_fresh()
     with pytest.raises(TypeError, match="only define one Config subclass"):
         _ = cfg_mod.cfg.dup
@@ -92,6 +91,110 @@ def test_missing_yaml_file_is_auto_created(
     cfg_mod = _import_subgrade_config_fresh()
     assert cfg_mod.cfg.solo.x == 42
     assert solo_yaml.is_file()
+    assert solo_yaml.read_text(encoding="utf-8").strip() == "{}"
+
+
+def test_auto_yaml_template_nested_required_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """新建 yaml 时嵌套必填标量为 ``null``；模板含 null 时实例化可能校验失败，需捕获。"""
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "nest.py").write_text(
+        "from pydantic import BaseModel\n"
+        "from subgrade.config import Config\n"
+        "class Inner(BaseModel):\n"
+        "    a: str\n"
+        "class NestConfig(Config):\n"
+        "    inner: Inner\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CFG_BASEDIR", raising=False)
+    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    cfg_mod = _import_subgrade_config_fresh()
+    try:
+        _ = cfg_mod.cfg.nest
+    except ValidationError:
+        pass
+    nest_yaml = tmp_path / "settings" / "nest.yaml"
+    text = nest_yaml.read_text(encoding="utf-8")
+    assert "inner:" in text
+    assert yaml.safe_load(text)["inner"]["a"] is None
+
+
+def test_auto_yaml_template_list_placeholder_is_empty_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """必填列表字段占位为 ``[]``。"""
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "lst.py").write_text(
+        "from subgrade.config import Config\n"
+        "class LstConfig(Config):\n"
+        "    items: list[str]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CFG_BASEDIR", raising=False)
+    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    cfg_mod = _import_subgrade_config_fresh()
+    try:
+        _ = cfg_mod.cfg.lst
+    except ValidationError:
+        pass
+    lst_yaml = tmp_path / "settings" / "lst.yaml"
+    data = yaml.safe_load(lst_yaml.read_text(encoding="utf-8"))
+    assert data == {"items": []}
+
+
+def test_auto_yaml_template_composite_type_annotations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """常见复合注解拆包：``Union``、``typing.List/Dict``、``Annotated``、嵌套模型、带默认的 ``Optional`` 不出现在模板。"""
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "comp.py").write_text(
+        "from __future__ import annotations\n"
+        "from typing import Annotated, Dict, List, Optional, Union\n"
+        "from pydantic import BaseModel, Field\n"
+        "from subgrade.config import Config\n"
+        "class Inner(BaseModel):\n"
+        "    z: int\n"
+        "class CompConfig(Config):\n"
+        "    scalar_union: Union[str, int]\n"
+        "    lst_typing: List[str]\n"
+        "    mapping: Dict[str, int]\n"
+        "    ann: Annotated[str, Field(description='d')]\n"
+        "    inner: Inner\n"
+        "    optional_inner: Optional[Inner]\n"
+        "    maybe_skip: Optional[str] = None\n"
+        "    maybe_skip_2: Annotated[Optional[str], Field(default=None)]\n"
+        "    nested_annotated: Annotated[Inner, Field(description='d')]\n"
+        "    nested_annotated_2: Annotated[Inner | None, Field(description='d')]\n"
+        "    nested_annotated_3: Annotated[Inner | Dict, Field(description='d')]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CFG_BASEDIR", raising=False)
+    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    cfg_mod = _import_subgrade_config_fresh()
+    try:
+        _ = cfg_mod.cfg.comp
+    except ValidationError:
+        pass
+    data = yaml.safe_load(
+        (tmp_path / "settings" / "comp.yaml").read_text(encoding="utf-8")
+    )
+    assert "maybe_skip" not in data
+    assert data == {
+        "scalar_union": None,
+        "lst_typing": [],
+        "mapping": {},
+        "ann": None,
+        "inner": {"z": None},
+        "optional_inner": {"z": None},
+        "nested_annotated": {"z": None},
+        "nested_annotated_2": {"z": None},
+        "nested_annotated_3": None,
+    }
 
 
 # --- 4. 仅存在 .yml 时可读取 ---
