@@ -28,6 +28,78 @@ def _cfg_getattr_fails(cfg_obj: object, name: str) -> bool:
     return False
 
 
+# --- 需求：统一入口 / 懒加载 / 实例缓存 ---
+
+
+def test_unified_entry_cfg_is_configs_with_getattr(
+    project_root_without_env: Path,
+) -> None:
+    """统一入口：``from subgrade.config import cfg`` 为 ``Configs`` 单例，通过 ``cfg.<模块名>`` 取配置实例。"""
+    cfg_mod = _import_subgrade_config_fresh()
+    assert Path.cwd() == project_root_without_env
+    assert type(cfg_mod.cfg).__name__ == "Configs"
+    assert cfg_mod.cfg.app.label == "from-yaml"
+
+
+def test_lazy_load_dynamic_module_not_in_sys_modules_until_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """懒加载：import ``subgrade.config`` 只注册路径，不 ``exec`` configs 下脚本，首次 ``cfg.<stem>`` 才加载模块。"""
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "lazyonly.py").write_text(
+        "from subgrade.config import Config\n"
+        "class LazyonlyConfig(Config):\n"
+        "    n: int = 0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CFG_BASEDIR", raising=False)
+    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    qual = "subgrade._cfgmod.lazyonly"
+    cfg_mod = _import_subgrade_config_fresh()
+    assert qual not in sys.modules
+    assert cfg_mod.cfg.lazyonly.n == 0
+    assert qual in sys.modules
+
+
+def test_cfg_access_returns_same_cached_instance(
+    project_root_without_env: Path,
+) -> None:
+    """同一 ``cfg.<name>`` 多次访问返回同一缓存实例。"""
+    cfg_mod = _import_subgrade_config_fresh()
+    a = cfg_mod.cfg.app
+    b = cfg_mod.cfg.app
+    assert a is b
+
+
+def test_auto_scan_picks_up_all_py_modules_in_configs_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """自动扫描：``configs`` 下每个合法 ``*.py`` 对应一个 ``cfg.<stem>``。"""
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "alpha.py").write_text(
+        "from subgrade.config import Config\n"
+        "class AlphaConfig(Config):\n"
+        "    v: int = 1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "configs" / "beta.py").write_text(
+        "from subgrade.config import Config\n"
+        "class BetaConfig(Config):\n"
+        "    w: int = 2\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "settings").mkdir()
+    for stem in ("alpha", "beta"):
+        (tmp_path / "settings" / f"{stem}.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CFG_BASEDIR", raising=False)
+    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    cfg_mod = _import_subgrade_config_fresh()
+    assert cfg_mod.cfg.alpha.v == 1
+    assert cfg_mod.cfg.beta.w == 2
+
+
 # --- 基础：相对路径 vs 环境变量 ---
 
 
