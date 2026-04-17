@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 from pathlib import Path
 import sys
+import threading
 
 from pydantic import ValidationError
 from pydantic_settings import SettingsConfigDict
@@ -98,6 +99,79 @@ def test_auto_scan_picks_up_all_py_modules_in_configs_dir(
     cfg_mod = _import_subgrade_config_fresh()
     assert cfg_mod.cfg.alpha.v == 1
     assert cfg_mod.cfg.beta.w == 2
+
+
+@pytest.mark.parametrize("root_env", ("SUBGRADE_PROJECT_ROOT", "PROJECT_ROOT"))
+def test_default_paths_resolve_to_external_project_root_not_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_env: str
+) -> None:
+    """未单独设置 CFG/SETTINGS 时，``configs``/``settings`` 相对 ``SUBGRADE_PROJECT_ROOT``（或 ``PROJECT_ROOT``），与 cwd 无关。"""
+    app = tmp_path / "external_app"
+    (app / "configs").mkdir(parents=True)
+    (app / "settings").mkdir()
+    (app / "configs" / "rooted.py").write_text(
+        "from subgrade.config import Config\n"
+        "class RootedConfig(Config):\n"
+        "    x: int = 1\n",
+        encoding="utf-8",
+    )
+    (app / "settings" / "rooted.yaml").write_text("{}\n", encoding="utf-8")
+    wrong_cwd = tmp_path / "wrong_cwd"
+    wrong_cwd.mkdir(parents=True)
+    monkeypatch.chdir(wrong_cwd)
+    monkeypatch.delenv("SUBGRADE_PROJECT_ROOT", raising=False)
+    monkeypatch.delenv("PROJECT_ROOT", raising=False)
+    monkeypatch.delenv("CFG_BASEDIR", raising=False)
+    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    monkeypatch.setenv(root_env, str(app.resolve()))
+    cfg_mod = _import_subgrade_config_fresh()
+    assert cfg_mod.project_root() == app.resolve()
+    assert cfg_mod.cfg.rooted.x == 1
+
+
+def test_project_root_discovered_by_walking_up_from_cwd_for_markers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """未设置环境变量时，自 cwd 向上查找 ``pyproject.toml`` 等标记以确定项目根（子目录内启动也可）。"""
+    repo = tmp_path / "repo"
+    (repo / "nested" / "deep").mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname='t'\n", encoding="utf-8")
+    (repo / "configs").mkdir()
+    (repo / "configs" / "inf.py").write_text(
+        "from subgrade.config import Config\n"
+        "class InfConfig(Config):\n"
+        "    n: int = 7\n",
+        encoding="utf-8",
+    )
+    (repo / "settings").mkdir()
+    (repo / "settings" / "inf.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.chdir(repo / "nested" / "deep")
+    monkeypatch.delenv("SUBGRADE_PROJECT_ROOT", raising=False)
+    monkeypatch.delenv("PROJECT_ROOT", raising=False)
+    monkeypatch.delenv("CFG_BASEDIR", raising=False)
+    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    cfg_mod = _import_subgrade_config_fresh()
+    assert cfg_mod.project_root() == repo.resolve()
+    assert cfg_mod.cfg.inf.n == 7
+
+
+def test_concurrent_first_access_yields_single_cached_instance(
+    project_root_without_env: Path,
+) -> None:
+    """多线程同时首次访问同一 ``cfg.<name>`` 时仅产生一个实例。"""
+    cfg_mod = _import_subgrade_config_fresh()
+    bag: list[object] = []
+
+    def grab() -> None:
+        bag.append(cfg_mod.cfg.app)
+
+    threads = [threading.Thread(target=grab) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(bag) == 16
+    assert all(obj is bag[0] for obj in bag)
 
 
 # --- 基础：相对路径 vs 环境变量 ---
