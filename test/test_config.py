@@ -21,6 +21,20 @@ def _import_subgrade_config_fresh() -> object:
     return importlib.import_module("subgrade.config")
 
 
+def _import_subgrade_config_and_logger_fresh() -> tuple[object, object]:
+    """``config`` 与 ``logger`` 一并重载，避免陈旧 ``LoggerConfig`` 仍指向已卸载的 ``_LibraryConfig``。"""
+    for name in list(sys.modules):
+        if (
+            name == "subgrade.config"
+            or name == "subgrade.logger"
+            or name.startswith("subgrade._cfgmod.")
+        ):
+            del sys.modules[name]
+    cfg_mod = importlib.import_module("subgrade.config")
+    logger_mod = importlib.import_module("subgrade.logger")
+    return cfg_mod, logger_mod
+
+
 def _cfg_getattr_fails(cfg_obj: object, name: str) -> bool:
     try:
         getattr(cfg_obj, name)
@@ -387,6 +401,114 @@ def test_config_class_outside_cfg_dir_not_on_cfg_but_instantiable(
 
     assert _cfg_getattr_fails(cfg_mod.cfg, "standalone")
     assert StandaloneConfig().value == "from-standalone"
+
+
+def test_library_config_root_resolve_instance_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_LibraryConfig`` 根类上调用 ``resolve_instance`` 应报错（仅临时工程，不依赖仓库根 ``configs``）。"""
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "dummy.py").write_text(
+        "from subgrade.config import Config\n"
+        "class DummyConfig(Config):\n"
+        "    v: int = 1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "settings").mkdir()
+    (tmp_path / "settings" / "dummy.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("SUBGRADE_PROJECT_ROOT", str(tmp_path.resolve()))
+    monkeypatch.delenv("CFG_BASEDIR", raising=False)
+    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    cfg_mod = _import_subgrade_config_fresh()
+    with pytest.raises(TypeError, match="concrete subclass"):
+        cfg_mod._LibraryConfig.resolve_instance()
+
+
+def _library_logger_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[object, type, type]:
+    """带 ``configs/dummy`` 的临时工程，并 fresh 加载 ``config`` + ``logger``。"""
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "dummy.py").write_text(
+        "from subgrade.config import Config\n"
+        "class DummyConfig(Config):\n"
+        "    v: int = 1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "settings").mkdir()
+    (tmp_path / "settings" / "dummy.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("SUBGRADE_PROJECT_ROOT", str(tmp_path.resolve()))
+    monkeypatch.delenv("CFG_BASEDIR", raising=False)
+    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    cfg_mod, _logger_mod = _import_subgrade_config_and_logger_fresh()
+    from subgrade.logger import LoggerConfig
+
+    class AppLoggerConfig(LoggerConfig):
+        """测试用最末子类；对应 ``settings/APPLOGGERCONFIG.yaml``。"""
+
+        marker: int = 42
+
+    return cfg_mod, LoggerConfig, AppLoggerConfig
+
+
+def test_logger_config_resolve_instance_furthest_subclass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """从 ``LoggerConfig`` 解析 ``resolve_instance`` 应得到链上最远端子类实例。"""
+    cfg_mod, LoggerConfig, AppLoggerConfig = _library_logger_project(
+        tmp_path, monkeypatch
+    )
+    inst = LoggerConfig.resolve_instance()
+    assert type(inst) is AppLoggerConfig
+    assert inst.marker == 42
+    assert _cfg_getattr_fails(cfg_mod.cfg, "logger")
+
+
+def test_logger_config_not_on_cfg_but_settings_yaml_after_resolve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """库 ``_LibraryConfig`` 子类不在 ``cfg`` 上；首次 ``resolve_instance`` 后在 ``settings/`` 出现 YAML。"""
+    cfg_mod, LoggerConfig, AppLoggerConfig = _library_logger_project(
+        tmp_path, monkeypatch
+    )
+    leaf_yaml = tmp_path / "settings" / "APPLOGGERCONFIG.yaml"
+    assert not leaf_yaml.is_file()
+    LoggerConfig.resolve_instance()
+    assert leaf_yaml.is_file()
+    assert _cfg_getattr_fails(cfg_mod.cfg, "logger")
+
+
+def test_logger_config_yaml_only_for_instantiated_class(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """默认模板仅在**实际被构造的叶子类**首次实例化时落盘，不顺带创建 ``LOGGERCONFIG.yaml``。"""
+    _, LoggerConfig, AppLoggerConfig = _library_logger_project(tmp_path, monkeypatch)
+    logger_yaml = tmp_path / "settings" / "LOGGERCONFIG.yaml"
+    leaf_yaml = tmp_path / "settings" / "APPLOGGERCONFIG.yaml"
+    assert not logger_yaml.is_file()
+    assert not leaf_yaml.is_file()
+    AppLoggerConfig.resolve_instance()
+    assert not logger_yaml.is_file()
+    assert leaf_yaml.is_file()
+
+
+def test_logger_config_resolve_instance_singleton(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同一叶子下多次 ``resolve_instance`` 返回同一对象。"""
+    _, LoggerConfig, AppLoggerConfig = _library_logger_project(tmp_path, monkeypatch)
+    a = LoggerConfig.resolve_instance()
+    b = AppLoggerConfig.resolve_instance()
+    assert a is b
+
+
+def test_logger_config_resolve_from_intermediate_same_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """从中间基类 ``LoggerConfig`` 与从叶子 ``AppLoggerConfig`` 解析到同一单例。"""
+    _, LoggerConfig, AppLoggerConfig = _library_logger_project(tmp_path, monkeypatch)
+    LoggerConfig.resolve_instance()
+    assert LoggerConfig.resolve_instance() is AppLoggerConfig.resolve_instance()
 
 
 # --- 6. 其它边界 ---

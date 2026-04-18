@@ -24,7 +24,7 @@ _CFG_MOD_PREFIX = "subgrade._cfgmod"
 # 懒加载与缓存并发保护（同进程多线程首次访问同一 cfg.<name>）
 _configs_state_lock = threading.RLock()
 
-# 自 cwd 向上探测「项目根」时识别的标记（与 Black、Ruff、Prettier 等从工作目录找根目录的思路类似）
+# 自 cwd 向上探测「项目根」时识别的标记
 _ROOT_MARKERS: tuple[tuple[str, str], ...] = (
     ("file", "pyproject.toml"),
     ("file", "setup.cfg"),
@@ -212,6 +212,78 @@ def _ensure_module_yaml(
     return [yaml_path], True
 
 
+_library_config_state_lock = threading.RLock()
+
+
+def _is_library_config_root(tp: type) -> bool:
+    """``subgrade.config`` 内的 ``_LibraryConfig`` 抽象根，不参与 registry、不直接实例化。"""
+    return (
+        tp.__name__ == "_LibraryConfig" and getattr(tp, "__module__", None) == __name__
+    )
+
+
+class _LibraryConfigMeta(type(BaseModel)):
+    """库内配置元类：维护「基类 → 当前最末直接子类」映射，供 ``resolve_instance`` 解析到工程侧覆盖类。"""
+
+    _registry: dict[type, type] = {}
+    _instances: dict[type, BaseSettings] = {}
+    _pending_yaml_templates: dict[type, Path] = {}
+
+    def __new__(mcs, name: str, bases: tuple[type, ...], dct: dict[str, Any]) -> type:
+        mod = dct.get("__module__")
+        is_base = name == "_LibraryConfig" and mod == __name__
+        yaml_paths: list[Path] = []
+        pending_template = False
+
+        if isinstance(mod, str) and not is_base:
+            yaml_paths, pending_template = _ensure_module_yaml(
+                _settings_basedir(), name.upper()
+            )
+            env_prefix = f"{name.replace('Config', '').upper()}_"
+            default = SettingsConfigDict(
+                env_prefix=env_prefix,
+                yaml_file=yaml_paths,
+            )
+            if "model_config" not in dct:
+                dct["model_config"] = default
+            else:
+                dct["model_config"].setdefault("env_prefix", default["env_prefix"])
+                dct["model_config"].setdefault("yaml_file", default["yaml_file"])
+
+        new_cls = super().__new__(mcs, name, bases, dct)
+        if is_base:
+            return new_cls
+        mcs._registry[new_cls] = new_cls
+        for b in bases:
+            if (
+                isinstance(b, type)
+                and type(b) is mcs
+                and not _is_library_config_root(b)
+            ):
+                mcs._registry[b] = new_cls
+        if isinstance(mod, str) and pending_template:
+            mcs._pending_yaml_templates[new_cls] = yaml_paths[0]
+        return new_cls
+
+    @classmethod
+    def write_pending_template_if_needed(mcs, cls: type) -> None:
+        """仅为**当前**被构造的类写入尚缺的默认 YAML（不沿 MRO 为祖先类补写）。"""
+        if _is_library_config_root(cls):
+            return
+        path = mcs._pending_yaml_templates.get(cls, None)
+        if path is None:
+            return
+        if not path.is_file():
+            _write_config_yaml_template(cls, path)
+        mcs._pending_yaml_templates.pop(cls, None)
+
+    def __call__(cls, *args: Any, **kwargs: Any) -> Any:
+        if not _is_library_config_root(cls):
+            with _library_config_state_lock:
+                type(cls).write_pending_template_if_needed(cls)
+        return super(_LibraryConfigMeta, cls).__call__(cls, *args, **kwargs)
+
+
 def _load_cfg_module(path: Path, stem: str) -> None:
     qualname = f"{_CFG_MOD_PREFIX}.{stem}"
     if qualname in sys.modules:
@@ -302,6 +374,50 @@ class ConfigMeta(type(BaseModel)):
             _write_config_yaml_template(new_cls, primary)
         Configs.__configs__[module_name] = new_cls
         return Configs.__configs__[module_name]
+
+
+class _LibraryConfig(BaseSettings, metaclass=_LibraryConfigMeta):
+    """库内可被子类替换的配置基类；实际实例请通过 ``resolve_instance`` 获取。"""
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+            YamlConfigSettingsSource(settings_cls),
+        )
+
+    @classmethod
+    def _resolve_leaf_type(cls) -> type[BaseSettings]:
+        meta = type(cls)
+        cur: type[BaseSettings] = cls
+        while True:
+            nxt = meta._registry.get(cur, cur)
+            if nxt is cur:
+                return cur
+            cur = nxt
+
+    @classmethod
+    def resolve_instance(cls) -> BaseSettings:
+        if _is_library_config_root(cls):
+            raise TypeError(
+                "_LibraryConfig is not a concrete class, please use a concrete subclass"
+            )
+        meta = type(cls)
+        leaf = cls._resolve_leaf_type()
+        with _library_config_state_lock:
+            if leaf not in meta._instances:
+                meta._instances[leaf] = leaf()
+        return meta._instances[leaf]
 
 
 class Config(BaseSettings, metaclass=ConfigMeta):
