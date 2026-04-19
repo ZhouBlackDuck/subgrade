@@ -1,6 +1,6 @@
 [project]
 name = "subgrade"
-version = "0.1.0"
+version = "0.1.1"
 description = "self-use foundation for layered configs and log"
 authors = [
     {name = "blackturtle",email = "blacktuitle@gmail.com"}
@@ -23,6 +23,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 exclude = ["test/"]
+readme = ["README.md"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"
