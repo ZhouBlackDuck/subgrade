@@ -240,6 +240,7 @@ class _LibraryConfigMeta(type(BaseModel)):
                 env_prefix=env_prefix,
                 yaml_file=yaml_paths,
                 env_file=".env",
+                dotenv_filtering="match_prefix",
             )
             if "model_config" not in dct:
                 dct["model_config"] = default
@@ -247,6 +248,9 @@ class _LibraryConfigMeta(type(BaseModel)):
                 dct["model_config"].setdefault("env_prefix", default["env_prefix"])
                 dct["model_config"].setdefault("yaml_file", default["yaml_file"])
                 dct["model_config"].setdefault("env_file", default["env_file"])
+                dct["model_config"].setdefault(
+                    "dotenv_filtering", default["dotenv_filtering"]
+                )
 
         new_cls = super().__new__(mcs, name, bases, dct)
         if is_base:
@@ -375,6 +379,7 @@ class ConfigMeta(type(BaseModel)):
             env_prefix=env_prefix,
             yaml_file=yaml_paths,
             env_file=".env",
+            dotenv_filtering="match_prefix",
         )
         if "model_config" not in dct:
             dct["model_config"] = default
@@ -382,6 +387,9 @@ class ConfigMeta(type(BaseModel)):
             dct["model_config"].setdefault("env_prefix", default["env_prefix"])
             dct["model_config"].setdefault("yaml_file", default["yaml_file"])
             dct["model_config"].setdefault("env_file", default["env_file"])
+            dct["model_config"].setdefault(
+                "dotenv_filtering", default["dotenv_filtering"]
+            )
 
         new_cls = super().__new__(mcs, name, bases, dct)
         if pending_template:
