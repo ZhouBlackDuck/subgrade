@@ -87,6 +87,105 @@ def test_cfg_access_returns_same_cached_instance(
     assert a is b
 
 
+# --- reload：丢弃动态模块与实例缓存 ---
+
+
+def test_cfg_reload_after_yaml_change_new_instance_and_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """修改磁盘 YAML 后 ``cfg.reload`` 再访问应读到新值且为新实例。"""
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "settings").mkdir()
+    (tmp_path / "configs" / "hot.py").write_text(
+        "from subgrade.config import Config\n"
+        "class HotConfig(Config):\n"
+        "    label: str = 'default'\n",
+        encoding="utf-8",
+    )
+    yaml_path = tmp_path / "settings" / "hot.yaml"
+    yaml_path.write_text("label: first\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CFG_BASEDIR", raising=False)
+    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    cfg_mod = _import_subgrade_config_fresh()
+    before = cfg_mod.cfg.hot
+    assert before.label == "first"
+    yaml_path.write_text("label: second\n", encoding="utf-8")
+    cfg_mod.cfg.reload("hot")
+    after = cfg_mod.cfg.hot
+    assert after.label == "second"
+    assert after is not before
+
+
+def test_cfg_reload_all_clears_every_registered_stem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """无参 ``reload()`` 对扫描到的全部茎名生效。"""
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "settings").mkdir()
+    for stem, field in (("one", "a"), ("two", "b")):
+        (tmp_path / "configs" / f"{stem}.py").write_text(
+            "from subgrade.config import Config\n"
+            f"class {stem.title()}Config(Config):\n"
+            f"    {field}: int = 0\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "settings" / f"{stem}.yaml").write_text(
+            f"{field}: 1\n", encoding="utf-8"
+        )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CFG_BASEDIR", raising=False)
+    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    cfg_mod = _import_subgrade_config_fresh()
+    o1, t1 = cfg_mod.cfg.one, cfg_mod.cfg.two
+    cfg_mod.cfg.reload()
+    o2, t2 = cfg_mod.cfg.one, cfg_mod.cfg.two
+    assert o2 is not o1
+    assert t2 is not t1
+    assert o2.a == 1 and t2.b == 1
+
+
+def test_cfg_reload_unknown_module_raises_attribute_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "only.py").write_text(
+        "from subgrade.config import Config\n"
+        "class OnlyConfig(Config):\n"
+        "    x: int = 0\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "settings").mkdir()
+    (tmp_path / "settings" / "only.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CFG_BASEDIR", raising=False)
+    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    cfg_mod = _import_subgrade_config_fresh()
+    with pytest.raises(AttributeError, match="Module 'ghost' not found"):
+        cfg_mod.cfg.reload("ghost")
+
+
+def test_cfg_reload_before_first_access_then_load_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """未访问过 ``cfg.<name>`` 时也可 ``reload``，随后首次访问正常。"""
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "settings").mkdir()
+    (tmp_path / "configs" / "late.py").write_text(
+        "from subgrade.config import Config\n"
+        "class LateConfig(Config):\n"
+        "    n: int = 3\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "settings" / "late.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CFG_BASEDIR", raising=False)
+    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    cfg_mod = _import_subgrade_config_fresh()
+    cfg_mod.cfg.reload("late")
+    assert cfg_mod.cfg.late.n == 3
+
+
 def test_auto_scan_picks_up_all_py_modules_in_configs_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -509,6 +608,91 @@ def test_logger_config_resolve_from_intermediate_same_instance(
     _, LoggerConfig, AppLoggerConfig = _library_logger_project(tmp_path, monkeypatch)
     LoggerConfig.resolve_instance()
     assert LoggerConfig.resolve_instance() is AppLoggerConfig.resolve_instance()
+
+
+def test_library_config_reload_singleton_re_reads_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``reload_library_config`` / ``reload_singletons`` 后再次 ``resolve_instance`` 重读 YAML 且为新对象。"""
+    cfg_mod, LoggerConfig, AppLoggerConfig = _library_logger_project(
+        tmp_path, monkeypatch
+    )
+    leaf_yaml = tmp_path / "settings" / "APPLOGGERCONFIG.yaml"
+    LoggerConfig.resolve_instance()
+    before = LoggerConfig.resolve_instance()
+    assert before.marker == 42
+    data = yaml.safe_load(leaf_yaml.read_text(encoding="utf-8")) or {}
+    data["marker"] = 99
+    new_text = yaml.safe_dump(
+        data,
+        allow_unicode=True,
+        default_flow_style=False,
+        sort_keys=False,
+    )
+    if not new_text.endswith("\n"):
+        new_text += "\n"
+    leaf_yaml.write_text(new_text, encoding="utf-8")
+    cfg_mod.reload_library_config(LoggerConfig)
+    after = AppLoggerConfig.resolve_instance()
+    assert after.marker == 99
+    assert after is not before
+    LoggerConfig.reload_singletons()
+    again = LoggerConfig.resolve_instance()
+    assert again is not after
+    assert again.marker == 99
+
+
+def test_reload_library_config_no_args_clears_all_library_singletons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """无参 ``reload_library_config()`` 清空全部 ``_LibraryConfig`` 单例缓存。"""
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "dummy.py").write_text(
+        "from subgrade.config import Config\n"
+        "class DummyConfig(Config):\n"
+        "    v: int = 1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "settings").mkdir()
+    (tmp_path / "settings" / "dummy.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("SUBGRADE_PROJECT_ROOT", str(tmp_path.resolve()))
+    monkeypatch.delenv("CFG_BASEDIR", raising=False)
+    monkeypatch.delenv("SETTINGS_BASEDIR", raising=False)
+    cfg_mod = _import_subgrade_config_fresh()
+
+    class LibA(cfg_mod._LibraryConfig):
+        v: int = 0
+
+    class LibB(cfg_mod._LibraryConfig):
+        w: int = 0
+
+    a1 = LibA.resolve_instance()
+    b1 = LibB.resolve_instance()
+    cfg_mod.reload_library_config()
+    a2 = LibA.resolve_instance()
+    b2 = LibB.resolve_instance()
+    assert a2 is not a1
+    assert b2 is not b1
+
+
+def test_reload_singletons_rejects_non_library_config_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg_mod, _, _ = _library_logger_project(tmp_path, monkeypatch)
+    from subgrade.config import Config
+
+    with pytest.raises(TypeError, match="Expected _LibraryConfig subclass"):
+        cfg_mod.reload_library_config(Config)
+
+
+def test_reload_singletons_rejects_library_root_as_explicit_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg_mod, _, _ = _library_logger_project(tmp_path, monkeypatch)
+    with pytest.raises(
+        TypeError, match="Cannot reload singleton for _LibraryConfig root"
+    ):
+        cfg_mod.reload_library_config(cfg_mod._LibraryConfig)
 
 
 # --- 6. 其它边界 ---

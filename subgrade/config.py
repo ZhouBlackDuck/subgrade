@@ -162,7 +162,7 @@ def _required_fields_placeholder_dict(model_cls: type[BaseModel]) -> dict[str, A
 
 def _write_config_yaml_template(settings_cls: type[BaseSettings], path: Path) -> None:
     """写入 YAML：必填字段为键；标量占位为 ``null``，列表为 ``[]``，映射为 ``{}``，嵌套为字典。"""
-    logger.info("Writing default settings template to %s", path.resolve())
+    logger.debug("Writing default settings template to %s", path.resolve())
     data = _required_fields_placeholder_dict(settings_cls)
     text = yaml.safe_dump(
         data,
@@ -203,7 +203,7 @@ def _ensure_module_yaml(
             paths.append(yml_path)
         return paths, False
     settings_root.mkdir(parents=True, exist_ok=True)
-    logger.info(
+    logger.debug(
         "No settings file for module %r under %s; will create default %s",
         module_name,
         settings_root.resolve(),
@@ -288,7 +288,7 @@ def _load_cfg_module(path: Path, stem: str) -> None:
     qualname = f"{_CFG_MOD_PREFIX}.{stem}"
     if qualname in sys.modules:
         return
-    logger.info("Loading config module %r from %s", stem, path.resolve())
+    logger.debug("Loading config module %r from %s", stem, path.resolve())
     spec = importlib.util.spec_from_file_location(qualname, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load config module from {path}")
@@ -319,7 +319,7 @@ class Configs:
             if not stem.isidentifier():
                 raise ValueError(f"Invalid config module name: '{stem}'")
             Configs.__config_modules__[stem] = partial(_load_cfg_module, path, stem)
-        logger.info(
+        logger.debug(
             "Registered %d config module(s) from %s",
             len(Configs.__config_modules__),
             cfg_dir.resolve(),
@@ -336,6 +336,21 @@ class Configs:
                 logger.debug("Instantiating settings for config module %r", name)
                 Configs.__cached__[name] = Configs.__configs__[name]()
             return Configs.__cached__[name]
+
+    def reload(self, *names: str) -> None:
+        """丢弃已加载的 ``configs/<name>.py`` 模块与 ``cfg.<name>`` 实例缓存；下次访问时重新执行模块并重建设置实例（会重新读 YAML 等）。
+
+        不传参数时，对 ``Configs`` 初始化时扫描到的全部 ``*.py`` 茎名逐一重载。
+        """
+        with _configs_state_lock:
+            targets = list(names) if names else list(Configs.__config_modules__.keys())
+            for name in targets:
+                if name not in Configs.__config_modules__:
+                    raise AttributeError(f"Module '{name}' not found")
+                qualname = f"{_CFG_MOD_PREFIX}.{name}"
+                Configs.__cached__.pop(name, None)
+                Configs.__configs__.pop(name, None)
+                sys.modules.pop(qualname, None)
 
 
 class ConfigMeta(type(BaseModel)):
@@ -419,6 +434,46 @@ class _LibraryConfig(BaseSettings, metaclass=_LibraryConfigMeta):
                 meta._instances[leaf] = leaf()
         return meta._instances[leaf]
 
+    @classmethod
+    def reload_singletons(cls, *roots: type[BaseSettings]) -> None:
+        """丢弃 ``resolve_instance`` 使用的单例缓存，使下次调用重新构造实例（重新读 YAML 等）。
+
+        - 无位置参数：若调用方是 ``_LibraryConfig`` 根类，则清空**全部**库内单例；否则只清空
+          自该类解析到的**叶子类型**对应的一条缓存（等价于 ``SomeConfig.reload_singletons()``）。
+        - 传入一个或多个 ``_LibraryConfig`` 的具体子类时：按各类解析到的叶子类型去重后逐一移除；
+          其中不得包含 ``_LibraryConfig`` 根类本身。
+        """
+        meta = type(cls)
+        with _library_config_state_lock:
+            if not roots:
+                if _is_library_config_root(cls):
+                    meta._instances.clear()
+                    return
+                if not isinstance(cls, type) or not issubclass(cls, _LibraryConfig):
+                    raise TypeError(
+                        "reload_singletons() without arguments requires a concrete "
+                        "_LibraryConfig subclass as the receiver"
+                    )
+                leaf = cls._resolve_leaf_type()
+                meta._instances.pop(leaf, None)
+                return
+            for r in roots:
+                if not isinstance(r, type) or not issubclass(r, _LibraryConfig):
+                    raise TypeError(f"Expected _LibraryConfig subclass, got {r!r}")
+                if _is_library_config_root(r):
+                    raise TypeError(
+                        "Cannot reload singleton for _LibraryConfig root; "
+                        "call _LibraryConfig.reload_singletons() with no arguments "
+                        "to clear all cached instances"
+                    )
+                leaf = r._resolve_leaf_type()
+                meta._instances.pop(leaf, None)
+
+
+def reload_library_config(*roots: type[BaseSettings]) -> None:
+    """``_LibraryConfig.reload_singletons`` 的模块级入口：参数语义与之一致（无参即清空全部库内单例）。"""
+    _LibraryConfig.reload_singletons(*roots)
+
 
 class Config(BaseSettings, metaclass=ConfigMeta):
     @classmethod
@@ -441,4 +496,4 @@ class Config(BaseSettings, metaclass=ConfigMeta):
 
 cfg = Configs()
 
-__all__ = ["cfg", "Config", "project_root"]
+__all__ = ["cfg", "Config", "project_root", "reload_library_config"]
