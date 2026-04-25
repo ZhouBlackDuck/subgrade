@@ -195,12 +195,8 @@ def _ensure_module_yaml(
     """解析或占位设置文件路径。若需新建 ``.yaml``，返回 ``(paths, True)``，由调用方在类创建后写入模板。"""
     yaml_path = settings_root / f"{module_name}.yaml"
     yml_path = settings_root / f"{module_name}.yml"
+    paths = [yaml_path, yml_path]
     if yaml_path.is_file() or yml_path.is_file():
-        paths: list[Path] = []
-        if yaml_path.is_file():
-            paths.append(yaml_path)
-        if yml_path.is_file():
-            paths.append(yml_path)
         return paths, False
     settings_root.mkdir(parents=True, exist_ok=True)
     logger.debug(
@@ -209,7 +205,7 @@ def _ensure_module_yaml(
         settings_root.resolve(),
         yaml_path.name,
     )
-    return [yaml_path], True
+    return paths, True
 
 
 _library_config_state_lock = threading.RLock()
@@ -243,12 +239,14 @@ class _LibraryConfigMeta(type(BaseModel)):
             default = SettingsConfigDict(
                 env_prefix=env_prefix,
                 yaml_file=yaml_paths,
+                env_file=".env",
             )
             if "model_config" not in dct:
                 dct["model_config"] = default
             else:
                 dct["model_config"].setdefault("env_prefix", default["env_prefix"])
                 dct["model_config"].setdefault("yaml_file", default["yaml_file"])
+                dct["model_config"].setdefault("env_file", default["env_file"])
 
         new_cls = super().__new__(mcs, name, bases, dct)
         if is_base:
@@ -376,12 +374,14 @@ class ConfigMeta(type(BaseModel)):
         default = SettingsConfigDict(
             env_prefix=env_prefix,
             yaml_file=yaml_paths,
+            env_file=".env",
         )
         if "model_config" not in dct:
             dct["model_config"] = default
         else:
             dct["model_config"].setdefault("env_prefix", default["env_prefix"])
             dct["model_config"].setdefault("yaml_file", default["yaml_file"])
+            dct["model_config"].setdefault("env_file", default["env_file"])
 
         new_cls = super().__new__(mcs, name, bases, dct)
         if pending_template:
