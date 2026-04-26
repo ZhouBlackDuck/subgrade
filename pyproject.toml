@@ -1,6 +1,6 @@
 [project]
 name = "subgrade"
-version = "0.1.5"
+version = "0.1.6"
 description = "self-use foundation for layered configs and log"
 authors = [
     {name = "blackturtle",email = "blacktuitle@gmail.com"}
