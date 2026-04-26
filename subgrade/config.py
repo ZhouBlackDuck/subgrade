@@ -242,6 +242,7 @@ class _LibraryConfigMeta(type(BaseModel)):
                 yaml_file=yaml_paths,
                 env_file=".env",
                 dotenv_filtering="match_prefix",
+                env_nested_delimiter="__",
             )
             if "model_config" not in dct:
                 dct["model_config"] = default
@@ -251,6 +252,9 @@ class _LibraryConfigMeta(type(BaseModel)):
                 dct["model_config"].setdefault("env_file", default["env_file"])
                 dct["model_config"].setdefault(
                     "dotenv_filtering", default["dotenv_filtering"]
+                )
+                dct["model_config"].setdefault(
+                    "env_nested_delimiter", default["env_nested_delimiter"]
                 )
 
         new_cls = super().__new__(mcs, name, bases, dct)
@@ -381,6 +385,7 @@ class ConfigMeta(type(BaseModel)):
             yaml_file=yaml_paths,
             env_file=".env",
             dotenv_filtering="match_prefix",
+            env_nested_delimiter="__",
         )
         if "model_config" not in dct:
             dct["model_config"] = default
@@ -390,6 +395,9 @@ class ConfigMeta(type(BaseModel)):
             dct["model_config"].setdefault("env_file", default["env_file"])
             dct["model_config"].setdefault(
                 "dotenv_filtering", default["dotenv_filtering"]
+            )
+            dct["model_config"].setdefault(
+                "env_nested_delimiter", default["env_nested_delimiter"]
             )
 
         new_cls = super().__new__(mcs, name, bases, dct)
